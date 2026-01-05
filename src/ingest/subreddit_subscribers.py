@@ -2,11 +2,13 @@
 
 Data source: subredditstats.com API - Historical subscriber time series (10+ years)
 
-Note: Reddit blocks cloud IPs, so we use a curated list of popular subreddits
-instead of fetching from Reddit's API.
+Note: Reddit blocks cloud IPs, so we read from a pre-fetched subreddits.json file
+that was generated locally from Reddit's API.
 """
 
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pyarrow as pa
 from ratelimit import limits, sleep_and_retry
@@ -18,72 +20,40 @@ from subsets_utils import get, save_raw_parquet, load_state, save_state
 # Rate limits for subredditstats.com
 STATS_CALLS_PER_MINUTE = 30
 
-# Curated list of popular subreddits (Reddit blocks cloud IPs)
-# This list covers major categories: news, entertainment, tech, gaming, finance, etc.
-POPULAR_SUBREDDITS = [
-    # Top general
-    "AskReddit", "funny", "pics", "gaming", "worldnews", "news", "movies", "todayilearned",
-    "science", "aww", "music", "videos", "memes", "Showerthoughts", "EarthPorn",
-    "explainlikeimfive", "IAmA", "books", "LifeProTips", "space", "DIY", "Jokes",
-    "food", "sports", "television", "gadgets", "nottheonion", "OldSchoolCool",
-    "Documentaries", "photoshopbattles", "GetMotivated", "UpliftingNews", "history",
-    # Tech
-    "technology", "programming", "Python", "javascript", "webdev", "learnprogramming",
-    "dataisbeautiful", "MachineLearning", "artificial", "linux", "apple", "Android",
-    "Bitcoin", "CryptoCurrency", "ethereum", "cscareerquestions",
-    # Gaming
-    "leagueoflegends", "pcgaming", "PS5", "xbox", "NintendoSwitch", "Minecraft",
-    "Overwatch", "FortNiteBR", "gaming", "Games", "Steam", "buildapc", "pcmasterrace",
-    "truegaming", "patientgamers", "GameDeals", "IndieGaming",
-    # Finance
-    "wallstreetbets", "stocks", "investing", "personalfinance", "financialindependence",
-    "CreditCards", "churning", "povertyfinance", "Bogleheads", "options",
-    # Entertainment
-    "Marvel", "DCcomics", "StarWars", "harrypotter", "gameofthrones", "anime",
-    "manga", "netflix", "television", "movies", "horror", "scifi", "Fantasy",
-    # Sports
-    "nba", "nfl", "soccer", "baseball", "hockey", "MMA", "CFB", "CollegeBasketball",
-    "formula1", "tennis", "golf", "running", "Fitness", "bodybuilding",
-    # Lifestyle
-    "Art", "ArtFundamentals", "drawing", "photography", "crafts", "sewing",
-    "woodworking", "gardening", "plants", "cooking", "recipes", "MealPrepSunday",
-    "EatCheapAndHealthy", "vegan", "keto", "loseit", "progresspics",
-    # Discussion
-    "AskScience", "askphilosophy", "changemyview", "unpopularopinion", "TrueOffMyChest",
-    "relationship_advice", "AmItheAsshole", "tifu", "confession", "NoStupidQuestions",
-    # News & Politics
-    "politics", "worldpolitics", "geopolitics", "economics", "environment",
-    # Humor
-    "mildlyinteresting", "mildlyinfuriating", "Unexpected", "WatchPeopleDieInside",
-    "PublicFreakout", "facepalm", "CrappyDesign", "assholedesign",
-    # Animals
-    "cats", "dogs", "AnimalsBeingDerps", "AnimalsBeingBros", "NatureIsFuckingLit",
-    "natureismetal", "Eyebleach", "rarepuppers", "aww",
-    # Meta / Community
-    "AskMen", "AskWomen", "TwoXChromosomes", "MensLib", "teenagers", "college",
-    "Parenting", "raisedbynarcissists", "ADHD", "depression", "anxiety",
-    # Hobbies
-    "Lego", "boardgames", "DnD", "rpg", "MagicArena", "chess", "poker",
-    "audiophile", "headphones", "vinyl", "Guitar", "WeAreTheMusicMakers",
-    # Education
-    "education", "Teachers", "college", "GradSchool", "ApplyingToCollege",
-    "languagelearning", "learn_arabic", "Spanish", "French", "German",
-    # Career
-    "jobs", "resumes", "careerguidance", "ITCareerQuestions", "EngineeringStudents",
-    # Home
-    "HomeImprovement", "InteriorDesign", "malelivingspace", "CozyPlaces",
-    "RoomPorn", "Frugal", "BuyItForLife", "minimalism",
-    # Local / Regional
-    "AskAnAmerican", "AskEurope", "AskUK", "canada", "australia", "india",
-    "europe", "unitedkingdom", "de", "france", "japan",
-    # Science
-    "askscience", "chemistry", "Physics", "biology", "neuroscience", "Astronomy",
-    "geology", "engineering", "math", "statistics",
-    # Misc popular
-    "TIHI", "cursedcomments", "BrandNewSentence", "rareinsults", "oddlysatisfying",
-    "Satisfyingasfuck", "interestingasfuck", "Damnthatsinteresting", "BeAmazed",
-    "nextfuckinglevel", "HumansBeingBros", "MadeMeSmile",
-]
+
+def load_subreddit_list() -> list[str]:
+    """Load subreddit list from pre-fetched JSON file.
+
+    The subreddits.json file is generated locally (Reddit blocks cloud IPs)
+    and committed to the repo. To refresh, run locally:
+
+        python -c "
+        import httpx, json, time
+        subs, after = [], None
+        while len(subs) < 2000:
+            r = httpx.get('https://www.reddit.com/subreddits/popular.json',
+                params={'limit': 100, 'after': after} if after else {'limit': 100},
+                headers={'User-Agent': 'SubredditStats/1.0'}, timeout=30)
+            data = r.json()['data']
+            subs.extend(c['data']['display_name'] for c in data['children'])
+            after = data.get('after')
+            if not after: break
+            time.sleep(0.5)
+        json.dump(subs, open('subreddits.json', 'w'), indent=2)
+        "
+    """
+    # Find subreddits.json relative to this file (in repo root)
+    repo_root = Path(__file__).parent.parent.parent
+    subreddits_file = repo_root / "subreddits.json"
+
+    if not subreddits_file.exists():
+        raise FileNotFoundError(
+            f"subreddits.json not found at {subreddits_file}. "
+            "Run the local fetch script to generate it."
+        )
+
+    with open(subreddits_file) as f:
+        return json.load(f)
 
 
 @sleep_and_retry
@@ -116,9 +86,9 @@ def run():
     state = load_state("subreddit_subscribers")
     fetched_subreddits = set(state.get("fetched", []))
 
-    # Use curated list (Reddit blocks cloud IPs)
-    subreddits = POPULAR_SUBREDDITS
-    print(f"  Using curated list of {len(subreddits)} popular subreddits")
+    # Load from pre-fetched file (Reddit blocks cloud IPs)
+    subreddits = load_subreddit_list()
+    print(f"  Loaded {len(subreddits)} subreddits from subreddits.json")
 
     # Fetch historical data for each subreddit
     pending = [s for s in subreddits if s not in fetched_subreddits]
