@@ -12,6 +12,7 @@ To refresh the list:
 """
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,6 +25,9 @@ from subsets_utils import get, save_raw_parquet, load_state, save_state
 
 # Rate limits for subredditstats.com
 STATS_CALLS_PER_MINUTE = 30
+
+# Leave buffer for transforms + log upload (GitHub hard limit is 6h)
+GH_ACTIONS_MAX_RUN_SECONDS = 5.8 * 60 * 60  # ~5h 48m
 
 
 def load_subreddit_list() -> list[str]:
@@ -71,12 +75,17 @@ def utc_day_to_date(utc_day: int) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
-def run():
-    """Fetch subscriber time series for top subreddits."""
+def run() -> bool:
+    """Fetch subscriber time series for top subreddits.
+
+    Returns:
+        bool: True if more work remains (should retrigger), False if complete
+    """
+    start_time = time.time()
     state = load_state("subreddit_subscribers")
     fetched_subreddits = set(state.get("fetched", []))
 
-    # Load from pre-fetched file (Reddit blocks cloud IPs)
+    # Load from pre-fetched file
     subreddits = load_subreddit_list()
     print(f"  Loaded {len(subreddits)} subreddits from subreddits.json")
 
@@ -85,6 +94,12 @@ def run():
     print(f"  Fetching stats for {len(pending)} subreddits ({len(fetched_subreddits)} already done)...")
 
     for i, subreddit in enumerate(pending):
+        # Check time budget before processing
+        elapsed = time.time() - start_time
+        if elapsed >= GH_ACTIONS_MAX_RUN_SECONDS:
+            print(f"  Time budget exhausted after {elapsed/3600:.1f} hours, {len(pending) - i} subreddits remaining")
+            return True  # More work to do
+
         print(f"    [{i+1}/{len(pending)}] {subreddit}...", end=" ", flush=True)
 
         try:
@@ -92,12 +107,16 @@ def run():
 
             if not stats:
                 print("not found")
+                fetched_subreddits.add(subreddit)
+                save_state("subreddit_subscribers", {"fetched": list(fetched_subreddits)})
                 continue
 
             time_series = stats.get("subscriberCountTimeSeries", [])
 
             if not time_series:
                 print("no time series")
+                fetched_subreddits.add(subreddit)
+                save_state("subreddit_subscribers", {"fetched": list(fetched_subreddits)})
                 continue
 
             # Convert to table format
@@ -122,14 +141,15 @@ def run():
 
                 save_raw_parquet(table, f"subscribers/{subreddit}")
                 print(f"{len(rows)} days")
-
-                fetched_subreddits.add(subreddit)
-                save_state("subreddit_subscribers", {"fetched": list(fetched_subreddits)})
             else:
                 print("empty")
+
+            fetched_subreddits.add(subreddit)
+            save_state("subreddit_subscribers", {"fetched": list(fetched_subreddits)})
 
         except Exception as e:
             print(f"error: {e}")
             continue
 
     print(f"  Done! Fetched data for {len(fetched_subreddits)} subreddits")
+    return False  # All done
