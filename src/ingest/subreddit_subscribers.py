@@ -2,8 +2,13 @@
 
 Data source: subredditstats.com API - Historical subscriber time series (10+ years)
 
-Note: Reddit blocks cloud IPs, so we read from a pre-fetched subreddits.json file
-that was generated locally from Reddit's API.
+Note: We read from a pre-fetched subreddits.json file containing top 100k subreddits
+by subscriber count. This list was extracted from Arctic Shift's Reddit archive.
+
+To refresh the list:
+    1. Download subreddits_YYYY-MM.zst from:
+       https://github.com/ArthurHeitmann/arctic_shift/releases
+    2. Run: python scripts/fetch_subreddit_list.py <downloaded_file.zst>
 """
 
 import json
@@ -24,23 +29,8 @@ STATS_CALLS_PER_MINUTE = 30
 def load_subreddit_list() -> list[str]:
     """Load subreddit list from pre-fetched JSON file.
 
-    The subreddits.json file is generated locally (Reddit blocks cloud IPs)
-    and committed to the repo. To refresh, run locally:
-
-        python -c "
-        import httpx, json, time
-        subs, after = [], None
-        while len(subs) < 2000:
-            r = httpx.get('https://www.reddit.com/subreddits/popular.json',
-                params={'limit': 100, 'after': after} if after else {'limit': 100},
-                headers={'User-Agent': 'SubredditStats/1.0'}, timeout=30)
-            data = r.json()['data']
-            subs.extend(c['data']['display_name'] for c in data['children'])
-            after = data.get('after')
-            if not after: break
-            time.sleep(0.5)
-        json.dump(subs, open('subreddits.json', 'w'), indent=2)
-        "
+    Contains top 100k subreddits by subscriber count from Arctic Shift data.
+    See module docstring for refresh instructions.
     """
     # Find subreddits.json relative to this file (in repo root)
     repo_root = Path(__file__).parent.parent.parent
