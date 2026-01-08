@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from deltalake import DeltaTable
 from .environment import get_data_dir, is_cloud_mode
@@ -9,6 +10,10 @@ def publish(dataset_name: str, metadata: dict):
         raise ValueError("Missing required field: 'id'")
     if 'title' not in metadata:
         raise ValueError("Missing required field: 'title'")
+
+    connector_url = os.environ.get('GITHUB_CONNECTOR_URL')
+    if connector_url:
+        metadata['connector_url'] = connector_url
 
     if is_cloud_mode():
         table_uri = get_delta_table_uri(dataset_name)

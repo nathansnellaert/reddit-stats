@@ -23,8 +23,11 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from subsets_utils import get, save_raw_parquet, load_state, save_state
 
 
-# Rate limits for subredditstats.com
-STATS_CALLS_PER_MINUTE = 30
+# Rate limits for subredditstats.com - conservative to avoid blocks
+STATS_CALLS_PER_MINUTE = 15
+
+# Max consecutive errors before stopping (API might be blocking us)
+MAX_CONSECUTIVE_ERRORS = 50
 
 # Leave buffer for transforms + log upload (GitHub hard limit is 6h)
 GH_ACTIONS_MAX_RUN_SECONDS = 5.8 * 60 * 60  # ~5h 48m
@@ -50,9 +53,26 @@ def load_subreddit_list() -> list[str]:
         return json.load(f)
 
 
+class PermanentError(Exception):
+    """Error that shouldn't be retried (404, 403, etc.)"""
+    pass
+
+
+def should_retry(exception):
+    """Only retry on transient errors."""
+    if isinstance(exception, PermanentError):
+        return False
+    return True
+
+
 @sleep_and_retry
 @limits(calls=STATS_CALLS_PER_MINUTE, period=60)
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=30))
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, min=5, max=120),
+    retry=lambda retry_state: should_retry(retry_state.outcome.exception()) if retry_state.outcome else True,
+    reraise=True
+)
 def fetch_subreddit_stats(subreddit: str) -> dict | None:
     """Fetch historical subscriber data from subredditstats.com."""
     url = f"https://subredditstats.com/api/subreddit"
@@ -60,8 +80,15 @@ def fetch_subreddit_stats(subreddit: str) -> dict | None:
 
     response = get(url, params=params, timeout=60.0)
 
+    # Permanent failures - don't retry
     if response.status_code == 404:
         return None
+    if response.status_code == 403:
+        raise PermanentError(f"Forbidden: {subreddit}")
+
+    # Rate limit - retry with backoff
+    if response.status_code == 429:
+        raise Exception(f"Rate limited (429) for {subreddit}")
 
     response.raise_for_status()
     return response.json()
@@ -84,14 +111,18 @@ def run() -> bool:
     start_time = time.time()
     state = load_state("subreddit_subscribers")
     fetched_subreddits = set(state.get("fetched", []))
+    failed_subreddits = set(state.get("failed", []))
 
     # Load from pre-fetched file
     subreddits = load_subreddit_list()
     print(f"  Loaded {len(subreddits)} subreddits from subreddits.json")
 
-    # Fetch historical data for each subreddit
-    pending = [s for s in subreddits if s not in fetched_subreddits]
-    print(f"  Fetching stats for {len(pending)} subreddits ({len(fetched_subreddits)} already done)...")
+    # Fetch historical data for each subreddit (skip already fetched AND failed)
+    pending = [s for s in subreddits if s not in fetched_subreddits and s not in failed_subreddits]
+    print(f"  Fetching stats for {len(pending)} subreddits ({len(fetched_subreddits)} done, {len(failed_subreddits)} failed)...")
+
+    consecutive_errors = 0
+    processed_this_run = 0
 
     for i, subreddit in enumerate(pending):
         # Check time budget before processing
@@ -100,15 +131,24 @@ def run() -> bool:
             print(f"  Time budget exhausted after {elapsed/3600:.1f} hours, {len(pending) - i} subreddits remaining")
             return True  # More work to do
 
+        # Stop if too many consecutive errors (API might be blocking us)
+        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            print(f"  Hit {consecutive_errors} consecutive errors - API may be blocking. Stopping to retry later.")
+            return True  # Signal for re-trigger
+
         print(f"    [{i+1}/{len(pending)}] {subreddit}...", end=" ", flush=True)
 
         try:
             stats = fetch_subreddit_stats(subreddit)
+            consecutive_errors = 0  # Reset on success
 
             if not stats:
                 print("not found")
                 fetched_subreddits.add(subreddit)
-                save_state("subreddit_subscribers", {"fetched": list(fetched_subreddits)})
+                save_state("subreddit_subscribers", {
+                    "fetched": list(fetched_subreddits),
+                    "failed": list(failed_subreddits)
+                })
                 continue
 
             time_series = stats.get("subscriberCountTimeSeries", [])
@@ -116,7 +156,10 @@ def run() -> bool:
             if not time_series:
                 print("no time series")
                 fetched_subreddits.add(subreddit)
-                save_state("subreddit_subscribers", {"fetched": list(fetched_subreddits)})
+                save_state("subreddit_subscribers", {
+                    "fetched": list(fetched_subreddits),
+                    "failed": list(failed_subreddits)
+                })
                 continue
 
             # Convert to table format
@@ -145,11 +188,27 @@ def run() -> bool:
                 print("empty")
 
             fetched_subreddits.add(subreddit)
-            save_state("subreddit_subscribers", {"fetched": list(fetched_subreddits)})
+            processed_this_run += 1
+            save_state("subreddit_subscribers", {
+                "fetched": list(fetched_subreddits),
+                "failed": list(failed_subreddits)
+            })
+
+        except PermanentError as e:
+            # Permanent failure - mark as failed and move on
+            print(f"permanent error: {e}")
+            failed_subreddits.add(subreddit)
+            consecutive_errors = 0  # Don't count permanent errors
+            save_state("subreddit_subscribers", {
+                "fetched": list(fetched_subreddits),
+                "failed": list(failed_subreddits)
+            })
 
         except Exception as e:
+            # Transient error - count it but don't mark as failed yet
             print(f"error: {e}")
-            continue
+            consecutive_errors += 1
+            # Don't add to failed - will retry on next run
 
-    print(f"  Done! Fetched data for {len(fetched_subreddits)} subreddits")
+    print(f"  Done! Fetched {processed_this_run} this run, {len(fetched_subreddits)} total, {len(failed_subreddits)} failed")
     return False  # All done

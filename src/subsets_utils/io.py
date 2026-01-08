@@ -12,19 +12,31 @@ import pyarrow.parquet as pq
 from deltalake import write_deltalake, DeltaTable
 from . import debug
 from .environment import get_data_dir
-from .r2 import is_cloud_mode, upload_bytes, upload_file, download_bytes, get_storage_options, get_delta_table_uri, get_bucket_name, get_connector_name
+from .r2 import is_cloud_mode, upload_bytes, upload_file, download_bytes, get_storage_options, get_delta_table_uri, get_bucket_name, get_connector_name, list_keys
+import fnmatch
 
 
 # --- Delta table operations ---
 
-def upload_data(data: pa.Table, dataset_name: str, metadata: dict = None, mode: str = "append", merge_key: str = None) -> str:
-    """Upload a PyArrow table to a Delta table."""
+def upload_data(data: pa.Table, dataset_name: str, metadata: dict = None, mode: str = "append", merge_key: str = None, partition_by: list[str] = None) -> str:
+    """Upload a PyArrow table to a Delta table.
+
+    Args:
+        data: PyArrow table to upload
+        dataset_name: Name of the dataset/table
+        metadata: Optional metadata dict
+        mode: "append", "overwrite", or "merge"
+        merge_key: Required when mode="merge", column to merge on
+        partition_by: Optional list of columns to partition by (e.g., ["taxonomy", "year"])
+    """
     if mode not in ("append", "overwrite", "merge"):
         raise ValueError(f"Invalid mode '{mode}'. Must be 'append', 'overwrite', or 'merge'.")
     if mode == "merge" and not merge_key:
         raise ValueError("merge_key is required when mode='merge'")
+    if mode == "merge" and partition_by:
+        raise ValueError("partition_by is not supported with mode='merge'")
     if mode == "overwrite":
-        print(f"⚠️  Warning: Overwriting {dataset_name} - all existing data will be replaced")
+        print(f"Warning: Overwriting {dataset_name} - all existing data will be replaced")
     if len(data) == 0:
         print(f"No data to upload for {dataset_name}")
         return ""
@@ -32,7 +44,8 @@ def upload_data(data: pa.Table, dataset_name: str, metadata: dict = None, mode: 
     size_mb = round(data.nbytes / 1024 / 1024, 2)
     columns = ', '.join([f.name for f in data.schema])
     mode_label = {"append": "Appending to", "overwrite": "Overwriting", "merge": "Merging into"}[mode]
-    print(f"{mode_label} {dataset_name}: {len(data)} rows, {len(data.schema)} cols ({columns}), {size_mb} MB")
+    partition_info = f", partitioned by {partition_by}" if partition_by else ""
+    print(f"{mode_label} {dataset_name}: {len(data)} rows, {len(data.schema)} cols ({columns}), {size_mb} MB{partition_info}")
 
     table_name = metadata.get("title") if metadata else None
     table_description = json.dumps(metadata) if metadata else None
@@ -60,6 +73,7 @@ def upload_data(data: pa.Table, dataset_name: str, metadata: dict = None, mode: 
     else:
         write_deltalake(table_uri, data, mode=mode, storage_options=storage_options,
                         name=table_name, description=table_description,
+                        partition_by=partition_by,
                         schema_mode="merge" if mode == "append" else "overwrite")
 
     # Log output
@@ -256,3 +270,67 @@ def load_raw_parquet(asset_id: str) -> pa.Table:
         if not path.exists():
             raise FileNotFoundError(f"Raw parquet asset '{asset_id}' not found at {path}")
         return pq.read_table(path)
+
+
+def list_raw_files(pattern: str = "*") -> list[str]:
+    """List raw asset IDs matching a glob pattern.
+
+    Pattern matches against the full asset path (e.g., "prices/*.json", "*.parquet").
+    Returns asset IDs without extensions (e.g., ["prices/bitcoin", "prices/ethereum"]).
+
+    Examples:
+        list_raw_files("prices/*.json")  -> ["prices/bitcoin", "prices/ethereum", ...]
+        list_raw_files("*.parquet")      -> ["page_views_2024-01", "page_views_2024-02", ...]
+        list_raw_files("data_DF_*.csv")  -> ["data_DF_YI", "data_DF_EMP", ...]
+    """
+    if is_cloud_mode():
+        prefix = f"{get_connector_name()}/data/raw/"
+        all_keys = list_keys(prefix)
+        # Strip prefix and match against pattern
+        assets = []
+        for key in all_keys:
+            relative = key[len(prefix):]  # e.g., "prices/bitcoin.json"
+            if fnmatch.fnmatch(relative, pattern):
+                # Remove extension to get asset_id
+                asset_id = relative.rsplit('.', 1)[0]
+                # Handle .json.gz double extension
+                if asset_id.endswith('.json'):
+                    asset_id = asset_id[:-5]
+                assets.append(asset_id)
+        return sorted(assets)
+    else:
+        raw_dir = Path(get_data_dir()) / "raw"
+        if not raw_dir.exists():
+            return []
+        # Glob locally
+        matches = list(raw_dir.glob(pattern))
+        assets = []
+        for path in matches:
+            relative = path.relative_to(raw_dir)
+            asset_id = str(relative).rsplit('.', 1)[0]
+            if asset_id.endswith('.json'):
+                asset_id = asset_id[:-5]
+            assets.append(asset_id)
+        return sorted(assets)
+
+
+def raw_exists(asset_id: str, extension: str = None) -> bool:
+    """Check if a raw asset exists.
+
+    If extension is None, checks for common extensions (json, json.gz, parquet, csv).
+    """
+    extensions = [extension] if extension else ["json", "json.gz", "parquet", "csv"]
+
+    if is_cloud_mode():
+        for ext in extensions:
+            key = _raw_key(asset_id, ext)
+            data = download_bytes(key)
+            if data is not None:
+                return True
+        return False
+    else:
+        for ext in extensions:
+            path = Path(get_data_dir()) / "raw" / f"{asset_id}.{ext}"
+            if path.exists():
+                return True
+        return False
