@@ -112,42 +112,90 @@ def run() -> bool:
     state = load_state("subreddit_subscribers")
     fetched_subreddits = set(state.get("fetched", []))
     failed_subreddits = set(state.get("failed", []))
+    # Track subreddits that failed due to API blocking - retry after cooldown
+    blocked_subreddits = set(state.get("blocked", []))
+    blocked_at = state.get("blocked_at")  # ISO timestamp when blocking started
+
+    # Clear blocked list if enough time has passed (24 hours cooldown)
+    if blocked_at and blocked_subreddits:
+        blocked_time = datetime.fromisoformat(blocked_at)
+        hours_since_block = (datetime.now(timezone.utc) - blocked_time).total_seconds() / 3600
+        if hours_since_block >= 24:
+            print(f"  Clearing {len(blocked_subreddits)} blocked subreddits after {hours_since_block:.1f}h cooldown")
+            blocked_subreddits.clear()
+            blocked_at = None
+            save_state("subreddit_subscribers", {
+                "fetched": list(fetched_subreddits),
+                "failed": list(failed_subreddits),
+                "blocked": [],
+                "blocked_at": None
+            })
 
     # Load from pre-fetched file
     subreddits = load_subreddit_list()
     print(f"  Loaded {len(subreddits)} subreddits from subreddits.json")
 
-    # Fetch historical data for each subreddit (skip already fetched AND failed)
-    pending = [s for s in subreddits if s not in fetched_subreddits and s not in failed_subreddits]
-    print(f"  Fetching stats for {len(pending)} subreddits ({len(fetched_subreddits)} done, {len(failed_subreddits)} failed)...")
+    # Fetch historical data for each subreddit (skip already fetched, failed, AND blocked)
+    pending = [s for s in subreddits if s not in fetched_subreddits and s not in failed_subreddits and s not in blocked_subreddits]
+    print(f"  Fetching stats for {len(pending)} subreddits ({len(fetched_subreddits)} done, {len(failed_subreddits)} failed, {len(blocked_subreddits)} blocked)...")
+
+    if not pending and blocked_subreddits:
+        print(f"  All pending items are blocked. Waiting for cooldown.")
+        return False  # Don't retrigger - wait for scheduled run after cooldown
 
     consecutive_errors = 0
     processed_this_run = 0
+    current_block_batch = []  # Track subreddits that fail during current blocking period
 
     for i, subreddit in enumerate(pending):
+        # Stop if too many consecutive errors (API might be blocking us)
+        # Check this BEFORE time budget - if we're blocked, don't burn time on retries
+        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            print(f"  Hit {consecutive_errors} consecutive errors - API is blocking.")
+            # Add all subreddits that failed during this block to blocked list
+            blocked_subreddits.update(current_block_batch)
+            save_state("subreddit_subscribers", {
+                "fetched": list(fetched_subreddits),
+                "failed": list(failed_subreddits),
+                "blocked": list(blocked_subreddits),
+                "blocked_at": datetime.now(timezone.utc).isoformat()
+            })
+            print(f"  Added {len(current_block_batch)} subreddits to blocked list for 24h cooldown")
+            return False  # Don't retrigger immediately - wait for cooldown
+
         # Check time budget before processing
         elapsed = time.time() - start_time
         if elapsed >= GH_ACTIONS_MAX_RUN_SECONDS:
+            # If we had consecutive errors, save them to blocked list before exiting
+            if current_block_batch:
+                blocked_subreddits.update(current_block_batch)
+                save_state("subreddit_subscribers", {
+                    "fetched": list(fetched_subreddits),
+                    "failed": list(failed_subreddits),
+                    "blocked": list(blocked_subreddits),
+                    "blocked_at": datetime.now(timezone.utc).isoformat()
+                })
+                print(f"  Time budget exhausted after {elapsed/3600:.1f}h, {len(pending) - i} remaining")
+                print(f"  Added {len(current_block_batch)} subreddits to blocked list (were failing)")
+                return False  # Don't retrigger - we're being blocked
             print(f"  Time budget exhausted after {elapsed/3600:.1f} hours, {len(pending) - i} subreddits remaining")
             return True  # More work to do
-
-        # Stop if too many consecutive errors (API might be blocking us)
-        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-            print(f"  Hit {consecutive_errors} consecutive errors - API may be blocking. Stopping to retry later.")
-            return True  # Signal for re-trigger
 
         print(f"    [{i+1}/{len(pending)}] {subreddit}...", end=" ", flush=True)
 
         try:
             stats = fetch_subreddit_stats(subreddit)
             consecutive_errors = 0  # Reset on success
+            current_block_batch.clear()  # Clear block batch on success
 
             if not stats:
                 print("not found")
                 fetched_subreddits.add(subreddit)
                 save_state("subreddit_subscribers", {
                     "fetched": list(fetched_subreddits),
-                    "failed": list(failed_subreddits)
+                    "failed": list(failed_subreddits),
+                    "blocked": list(blocked_subreddits),
+                    "blocked_at": blocked_at
                 })
                 continue
 
@@ -158,7 +206,9 @@ def run() -> bool:
                 fetched_subreddits.add(subreddit)
                 save_state("subreddit_subscribers", {
                     "fetched": list(fetched_subreddits),
-                    "failed": list(failed_subreddits)
+                    "failed": list(failed_subreddits),
+                    "blocked": list(blocked_subreddits),
+                    "blocked_at": blocked_at
                 })
                 continue
 
@@ -191,7 +241,9 @@ def run() -> bool:
             processed_this_run += 1
             save_state("subreddit_subscribers", {
                 "fetched": list(fetched_subreddits),
-                "failed": list(failed_subreddits)
+                "failed": list(failed_subreddits),
+                "blocked": list(blocked_subreddits),
+                "blocked_at": blocked_at
             })
 
         except PermanentError as e:
@@ -199,16 +251,19 @@ def run() -> bool:
             print(f"permanent error: {e}")
             failed_subreddits.add(subreddit)
             consecutive_errors = 0  # Don't count permanent errors
+            current_block_batch.clear()
             save_state("subreddit_subscribers", {
                 "fetched": list(fetched_subreddits),
-                "failed": list(failed_subreddits)
+                "failed": list(failed_subreddits),
+                "blocked": list(blocked_subreddits),
+                "blocked_at": blocked_at
             })
 
         except Exception as e:
-            # Transient error - count it but don't mark as failed yet
+            # Transient error - track for potential blocking
             print(f"error: {e}")
             consecutive_errors += 1
-            # Don't add to failed - will retry on next run
+            current_block_batch.append(subreddit)
 
     print(f"  Done! Fetched {processed_this_run} this run, {len(fetched_subreddits)} total, {len(failed_subreddits)} failed")
     return False  # All done
